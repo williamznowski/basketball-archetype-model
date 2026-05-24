@@ -1,2 +1,2 @@
 # basketball-archetype-model
-NBA analytics project using clustering, weighted similarity analysis, and custom trait scoring to identify player archetypes, compare stylistic similarities, and explore player profiles through an interactive Streamlit application.
+NBA analytics project using clustering, weighted similarity analysis, and custom trait scoring to identify player archetypes, compare stylistic similarities, and explore player profiles through an interactive Streamlit application. Development combined AI-assisted coding workflows with manual feature engineering, model design, statistical interpretation, and application refinement.
