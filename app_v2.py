@@ -1,0 +1,590 @@
+# scripts/app.py
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import streamlit as st
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics.pairwise import cosine_similarity
+
+
+# =========================
+# PATHS
+# =========================
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = BASE_DIR / "data" / "processed"
+
+MASTER_FILE = DATA_DIR / "master_player_stats.csv"
+ROLE_DATA_FILE = DATA_DIR / "nba_role_data_with_scores.csv"
+PROFILE_FILE = DATA_DIR / "player_role_profiles.csv"
+
+
+# =========================
+# PAGE SETUP
+# =========================
+
+st.set_page_config(
+    page_title="NBA Role Model",
+    layout="wide"
+)
+
+st.title("NBA Player Role Model")
+st.caption(
+    "v2 | 2025-26 NBA Regular Season"
+)
+st.caption("Search player archetypes, compare trait profiles, find similar players, and explore ranked tables.")
+
+
+# =========================
+# LOAD DATA
+# =========================
+
+@st.cache_data
+def load_data():
+    master = pd.read_csv(MASTER_FILE)
+    role_data = pd.read_csv(ROLE_DATA_FILE)
+    profiles = pd.read_csv(PROFILE_FILE)
+    return master, role_data, profiles
+
+
+master, role_data, profiles = load_data()
+
+
+# =========================
+# GLOBAL COLUMNS / LABELS
+# =========================
+
+score_cols = [
+    "Primary Creator_Score",
+    "Shooting Wing_Score",
+    "Rim Protector_Score",
+    "Stretch Big_Score",
+    "Defensive Wing_Score",
+    "Interior Finisher_Score"
+]
+
+trait_name_map = {
+    "Primary Creator_Score": "Playmaking",
+    "Shooting Wing_Score": "Perimeter Shooting",
+    "Rim Protector_Score": "Rim Protection",
+    "Stretch Big_Score": "Stretch Ability",
+    "Defensive Wing_Score": "Defensive Activity",
+    "Interior Finisher_Score": "Interior Scoring"
+}
+
+best_role_to_trait = {
+    "Primary Creator": "Playmaking",
+    "Shooting Wing": "Perimeter Shooting",
+    "Rim Protector": "Rim Protection",
+    "Stretch Big": "Stretch Ability",
+    "Defensive Wing": "Defensive Activity",
+    "Interior Finisher": "Interior Scoring"
+}
+
+# First-pass archetype names. Refine after deeper basketball validation.
+cluster_names = {
+    0: "Low-Usage 3&D Wings",
+    1: "Skilled Interior Bigs",
+    2: "Lead Guards",
+    3: "Rim-Running Centers",
+    4: "Offensive Hubs",
+    5: "Stretch Forwards",
+    6: "Defensive Utility Wings",
+    7: "Scoring Guards"
+}
+
+archetype_descriptions = {
+    "Low-Usage 3&D Wings": "Spacing-first wings who usually operate without heavy on-ball responsibility.",
+    "Skilled Interior Bigs": "Bigs with interior value, rebounding, finishing, and some passing or shooting skill.",
+    "Lead Guards": "Primary or secondary ball-handlers with strong creation and playmaking responsibility.",
+    "Rim-Running Centers": "Low-spacing bigs who provide rebounding, rim finishing, and paint protection.",
+    "Offensive Hubs": "High-usage creators who carry major shot creation and offensive decision-making burden.",
+    "Stretch Forwards": "Forward-sized players with spacing value and moderate rebounding or defensive activity.",
+    "Defensive Utility Wings": "Wing-sized players with defensive activity, positional flexibility, and lower offensive burden.",
+    "Scoring Guards": "Perimeter scorers and shooters with guard-heavy deployment and moderate creation."
+}
+
+# Add user-facing labels to both tables.
+profiles["Strongest_Trait"] = profiles["Best_Role"].map(best_role_to_trait).fillna(profiles["Best_Role"])
+profiles["Archetype"] = profiles["Cluster"].map(cluster_names).fillna("Unlabelled Archetype")
+
+role_data["Archetype"] = role_data["Cluster"].map(cluster_names).fillna("Unlabelled Archetype")
+
+# Keep a cleaner naming option for user-facing tables.
+profiles = profiles.rename(columns={"Average_Role_Score": "Average_Trait_Score"})
+if "Average_Role_Score" in role_data.columns:
+    role_data = role_data.rename(columns={"Average_Role_Score": "Average_Trait_Score"})
+
+average_trait_col = "Average_Trait_Score"
+
+
+# =========================
+# STAT GUIDE
+# =========================
+
+STAT_INFO = {
+    "USG%": "Usage Percentage: estimate of team plays used by a player while on court.",
+    "AST%": "Assist Percentage: estimate of teammate field goals assisted while on court.",
+    "3PAr": "3-Point Attempt Rate: share of field goal attempts taken from three.",
+    "FTr": "Free Throw Attempt Rate: free throw attempts per field goal attempt.",
+    "TRB%": "Total Rebound Percentage: estimate of available rebounds grabbed.",
+    "BLK%": "Block Percentage: estimate of opponent 2-point attempts blocked.",
+    "STL%": "Steal Percentage: estimate of opponent possessions ending in a steal.",
+    "TS%": "True Shooting Percentage: scoring efficiency including 2s, 3s, and free throws.",
+    "DBPM": "Defensive Box Plus/Minus: box-score estimate of defensive impact per 100 possessions.",
+    "3P%": "Three-Point Percentage: share of three-point attempts made.",
+    "PGA": "Points Generated by Assists: points scored by teammates from the player's assists.",
+    "On-Off": "On-Off Plus/Minus: team net rating difference when the player is on court versus off court."
+}
+
+
+def stat_help(stat):
+    if stat not in role_data.columns:
+        return "No data available for this stat."
+
+    median = role_data[stat].median()
+    description = STAT_INFO.get(stat, "No description added yet.")
+
+    return f"{description}\n\nLeague median in this dataset: {median:.2f}"
+
+
+def show_stat_guide(key_suffix=""):
+    selected_stat = st.selectbox(
+        "Choose a stat to explain",
+        list(STAT_INFO.keys()),
+        key=f"stat_guide_{key_suffix}"
+    )
+
+    st.info(stat_help(selected_stat))
+
+
+def clean_trait_labels(df):
+    """Rename internal score column names into user-facing trait labels."""
+    df = df.copy()
+
+    df.index = [trait_name_map.get(str(i), str(i)) for i in df.index]
+    df.columns = [trait_name_map.get(str(c), str(c)) for c in df.columns]
+
+    return df
+
+
+def format_trait_table(df):
+    """Clean labels and round numeric values for user-facing tables."""
+    df = clean_trait_labels(df)
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    df[numeric_cols] = df[numeric_cols].round(1)
+    return df
+
+
+def similarity_label(score):
+    if score >= 90:
+        return "Very similar role profile"
+    if score >= 80:
+        return "Strong similarity"
+    if score >= 70:
+        return "Moderate similarity"
+    if score >= 60:
+        return "Loose similarity"
+    return "Low similarity"
+
+
+# =========================
+# SIMILARITY ENGINE
+# =========================
+
+similarity_features = [
+    "AST%", "USG%", "TOV%", "BadPass", "LostBall", "PGA",
+    "3PAr", "3PAr+", "3P%", "TS%", "TS+",
+    "FTr", "FTr+", "And1",
+    "ORB%", "DRB%", "TRB%", "BLK%",
+    "STL%", "DBPM",
+    "PG%", "SG%", "SF%", "PF%", "C%"
+]
+
+feature_weights = {
+    "AST%": 1.6,
+    "USG%": 1.5,
+    "PGA": 1.3,
+    "TOV%": 0.6,
+    "BadPass": 0.5,
+    "LostBall": 0.5,
+    "3PAr": 1.5,
+    "3PAr+": 1.1,
+    "3P%": 0.9,
+    "TS%": 0.8,
+    "TS+": 0.8,
+    "FTr": 1.2,
+    "FTr+": 0.9,
+    "And1": 0.8,
+    "ORB%": 1.0,
+    "DRB%": 1.0,
+    "TRB%": 1.2,
+    "BLK%": 1.5,
+    "STL%": 1.1,
+    "DBPM": 0.9,
+    "PG%": 1.3,
+    "SG%": 1.0,
+    "SF%": 1.0,
+    "PF%": 1.0,
+    "C%": 1.3
+}
+
+
+@st.cache_data
+def build_similarity_matrix(role_data_input):
+    df = role_data_input[similarity_features].fillna(0)
+
+    scaler = StandardScaler()
+    x_scaled = scaler.fit_transform(df)
+
+    weights = np.array([feature_weights[col] for col in similarity_features])
+    x_weighted = x_scaled * weights
+
+    return cosine_similarity(x_weighted)
+
+
+similarity_matrix = build_similarity_matrix(role_data)
+
+
+def find_similar_players(player_name, top_n=10, same_cluster=False):
+    matches = role_data[role_data["Player"].str.contains(player_name, case=False, na=False)]
+
+    if matches.empty:
+        return pd.DataFrame()
+
+    player_index = matches.index[0]
+    player = role_data.loc[player_index, "Player"]
+    player_cluster = role_data.loc[player_index, "Cluster"]
+
+    results = role_data.copy()
+
+    results = results.merge(
+        profiles[["Player", "Strongest_Trait"]],
+        on="Player",
+        how="left"
+    )
+
+    raw_similarity = similarity_matrix[player_index]
+    results["Similarity"] = (((raw_similarity + 1) / 2) * 100).round(1)
+
+    results = results[results["Player"] != player]
+
+    if same_cluster:
+        results = results[results["Cluster"] == player_cluster]
+
+    cols = [
+        "Player", "Team", "Pos", "Archetype", "Strongest_Trait", "Similarity",
+        "USG%", "AST%", "3PAr", "FTr", "TRB%", "BLK%", "STL%", "TS%"
+    ]
+
+    return results.sort_values("Similarity", ascending=False)[cols].head(top_n)
+
+
+# =========================
+# RADAR CHART
+# =========================
+
+def plot_player_traits(player_row):
+    labels = [trait_name_map[c] for c in score_cols]
+    values = [float(player_row[c]) for c in score_cols]
+
+    values += values[:1]
+    angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
+    angles += angles[:1]
+
+    fig, ax = plt.subplots(figsize=(5.4, 5.4), subplot_kw=dict(polar=True))
+
+    ax.plot(angles, values, linewidth=2.5)
+    ax.fill(angles, values, alpha=0.20)
+
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(labels, fontsize=9)
+
+    ax.set_ylim(0, 100)
+    ax.set_rlabel_position(90)
+    ax.set_yticks([20, 40, 60, 80, 100])
+    ax.set_yticklabels(["20", "40", "60", "80", "100"], fontsize=8)
+
+    ax.tick_params(axis="x", pad=13)
+    ax.grid(True, alpha=0.35)
+
+    plt.title(
+        f"{player_row['Player']} Trait Profile",
+        fontsize=15,
+        pad=28
+    )
+
+    plt.tight_layout()
+    return fig
+
+
+# =========================
+# SIDEBAR
+# =========================
+
+page = st.sidebar.radio(
+    "Choose page",
+    [
+        "Player Search",
+        "Compare Players",
+        "Trait Rankings",
+        "Archetype Explorer",
+        "Raw Tables"
+    ]
+)
+
+with st.sidebar.expander("About this model"):
+    st.write(
+        "Archetypes are broad player families created from clustering. "
+        "Trait scores are continuous 0-100 ratings showing how strongly a player fits different basketball functions. "
+        "This is a prototype and should be treated as exploratory, not definitive scouting truth."
+    )
+
+
+# =========================
+# PLAYER SEARCH
+# =========================
+
+if page == "Player Search":
+    st.header("Player Search")
+
+    player_names = sorted(profiles["Player"].dropna().unique())
+
+    selected_player = st.selectbox("Search player", player_names)
+
+    profile_row = profiles[profiles["Player"] == selected_player].iloc[0]
+    role_row = role_data[role_data["Player"] == selected_player].iloc[0]
+
+    st.subheader(selected_player)
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Team", profile_row["Team"])
+    metric_cols[1].metric("Position", profile_row["Pos"])
+    metric_cols[2].metric("Archetype", profile_row["Archetype"])
+    metric_cols[3].metric("Strongest Trait", profile_row["Strongest_Trait"])
+
+    st.write(f"**Average Trait Score:** {profile_row[average_trait_col]}")
+
+    archetype_description = archetype_descriptions.get(profile_row["Archetype"], "No description available.")
+    st.info(f"**Archetype meaning:** {archetype_description}")
+
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        st.subheader("Trait Scores")
+        trait_scores = profile_row[score_cols].sort_values(ascending=False).to_frame("Score")
+        trait_scores = format_trait_table(trait_scores)
+        st.dataframe(trait_scores, use_container_width=True)
+
+    with col2:
+        fig = plot_player_traits(role_row)
+        st.pyplot(fig)
+
+    st.subheader("Most Similar Players")
+
+    same_cluster = st.checkbox("Only show same archetype", value=True)
+    top_n = st.slider("Number of similar players", 5, 25, 10)
+
+    similar_players = find_similar_players(
+        selected_player,
+        top_n=top_n,
+        same_cluster=same_cluster
+    )
+
+    st.dataframe(similar_players, use_container_width=True)
+
+    with st.expander("Stat Guide"):
+        show_stat_guide("player_search")
+
+
+# =========================
+# COMPARE PLAYERS
+# =========================
+
+elif page == "Compare Players":
+    st.header("Compare Players")
+
+    player_names = sorted(profiles["Player"].dropna().unique())
+
+    player_1 = st.selectbox("Player 1", player_names, index=0)
+    player_2 = st.selectbox("Player 2", player_names, index=1)
+
+    p1_profile = profiles[profiles["Player"] == player_1].iloc[0]
+    p2_profile = profiles[profiles["Player"] == player_2].iloc[0]
+
+    p1_role = role_data[role_data["Player"] == player_1].iloc[0]
+    p2_role = role_data[role_data["Player"] == player_2].iloc[0]
+
+    p1_index = role_data[role_data["Player"] == player_1].index[0]
+    p2_index = role_data[role_data["Player"] == player_2].index[0]
+
+    raw_similarity = similarity_matrix[p1_index, p2_index]
+    player_similarity = ((raw_similarity + 1) / 2) * 100
+
+    st.metric(
+        label="Role Similarity",
+        value=f"{player_similarity:.1f}/100",
+        help="Weighted cosine similarity converted onto a 0-100 scale. Higher means more similar statistical role profile."
+    )
+    st.caption(similarity_label(player_similarity))
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader(player_1)
+        st.write(f"**Team:** {p1_profile['Team']}")
+        st.write(f"**Archetype:** {p1_profile['Archetype']}")
+        st.write(f"**Strongest Trait:** {p1_profile['Strongest_Trait']}")
+        st.pyplot(plot_player_traits(p1_role))
+
+    with col2:
+        st.subheader(player_2)
+        st.write(f"**Team:** {p2_profile['Team']}")
+        st.write(f"**Archetype:** {p2_profile['Archetype']}")
+        st.write(f"**Strongest Trait:** {p2_profile['Strongest_Trait']}")
+        st.pyplot(plot_player_traits(p2_role))
+
+    comparison = pd.DataFrame(
+        {
+            player_1: p1_profile[score_cols].values,
+            player_2: p2_profile[score_cols].values,
+            "Difference": (p1_profile[score_cols].values - p2_profile[score_cols].values)
+        },
+        index=score_cols
+    )
+
+    comparison = format_trait_table(comparison)
+
+    st.subheader("Trait Score Comparison")
+    st.dataframe(comparison, use_container_width=True)
+
+    with st.expander("Stat Guide"):
+        show_stat_guide("compare")
+
+
+# =========================
+# TRAIT RANKINGS
+# =========================
+
+elif page == "Trait Rankings":
+    st.header("Trait Rankings")
+
+    trait_options = {trait_name_map[col]: col for col in score_cols}
+    trait_options["Average Trait Score"] = average_trait_col
+
+    selected_trait_label = st.selectbox("Choose trait", list(trait_options.keys()))
+    selected_trait_col = trait_options[selected_trait_label]
+
+    min_minutes = st.slider("Minimum minutes per game", 0, 35, 15)
+
+    archetype_filter = st.multiselect(
+        "Filter archetypes",
+        sorted(profiles["Archetype"].dropna().unique()),
+        default=[]
+    )
+
+    ranking_df = profiles[profiles["MP"] >= min_minutes].copy()
+
+    if archetype_filter:
+        ranking_df = ranking_df[ranking_df["Archetype"].isin(archetype_filter)]
+
+    ranking_df = ranking_df.sort_values(selected_trait_col, ascending=False)
+
+    display_cols = [
+        "Player", "Team", "Pos", "MP", "Archetype", "Strongest_Trait", selected_trait_col
+    ]
+
+    ranking_display = ranking_df[display_cols].head(75).copy()
+    ranking_display = ranking_display.rename(
+        columns={
+            selected_trait_col: selected_trait_label,
+            "Strongest_Trait": "Strongest Trait"
+        }
+    )
+
+    st.dataframe(ranking_display, use_container_width=True)
+
+    with st.expander("Stat Guide"):
+        show_stat_guide("rankings")
+
+
+# =========================
+# ARCHETYPE EXPLORER
+# =========================
+
+elif page == "Archetype Explorer":
+    st.header("Archetype Explorer")
+
+    archetype_options = {name: cluster for cluster, name in cluster_names.items()}
+
+    archetype_choice = st.selectbox("Choose archetype", list(archetype_options.keys()))
+    cluster_choice = archetype_options[archetype_choice]
+
+    cluster_df = role_data[role_data["Cluster"] == cluster_choice].copy()
+
+    st.subheader(archetype_choice)
+    st.info(archetype_descriptions.get(archetype_choice, "No description available."))
+    st.write(f"Players in archetype: {len(cluster_df)}")
+
+    st.subheader("Archetype Average Statistical Profile")
+
+    cluster_summary = cluster_df[
+        [
+            "USG%", "AST%", "3PAr", "FTr",
+            "TRB%", "BLK%", "STL%", "TS%",
+            "PG%", "SG%", "SF%", "PF%", "C%"
+        ]
+    ].mean().round(2)
+
+    st.dataframe(cluster_summary.to_frame("Average"), use_container_width=True)
+
+    st.subheader("Average Trait Profile")
+    archetype_trait_profile = cluster_df[score_cols].mean().round(1).to_frame("Average Score")
+    archetype_trait_profile = clean_trait_labels(archetype_trait_profile)
+    st.dataframe(archetype_trait_profile, use_container_width=True)
+
+    st.subheader("Players in Archetype")
+    st.dataframe(
+        cluster_df[
+            [
+                "Player", "Team", "Pos", "MP", "Archetype",
+                "USG%", "AST%", "3PAr", "TRB%", "BLK%", "TS%"
+            ]
+        ].sort_values("MP", ascending=False),
+        use_container_width=True
+    )
+
+    with st.expander("Stat Guide"):
+        show_stat_guide("archetype")
+
+
+# =========================
+# RAW TABLES
+# =========================
+
+elif page == "Raw Tables":
+    st.header("Raw Tables")
+    st.warning("These are backend tables. They are useful for debugging, not polished presentation.")
+
+    table_choice = st.selectbox(
+        "Choose table",
+        [
+            "Player Role Profiles",
+            "NBA Role Data With Scores",
+            "Master Player Stats"
+        ]
+    )
+
+    if table_choice == "Player Role Profiles":
+        st.dataframe(profiles, use_container_width=True)
+    elif table_choice == "NBA Role Data With Scores":
+        st.dataframe(role_data, use_container_width=True)
+    else:
+        st.dataframe(master, use_container_width=True)
+
+    with st.expander("Stat Guide"):
+        show_stat_guide("raw")
